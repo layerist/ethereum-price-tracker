@@ -1,55 +1,43 @@
 # Ethereum Price Tracker
 
-This script fetches and displays the price of Ethereum (ETH) in USD every second using the CoinMarketCap API. It runs in an infinite loop until the user stops it with a keyboard input.
+This script continuously tracks and prints the price of Ethereum (ETH) in USD using the CoinMarketCap API.
 
-## Requirements
+## Features
+
+- Fetches the current price of Ethereum every 5 seconds.
+- Handles potential API request errors gracefully.
+- Allows the user to stop the script with a simple keyboard input.
+
+## Prerequisites
 
 - Python 3.x
-- `requests` library
+- `requests` library (install with `pip install requests`)
+- A valid CoinMarketCap API key
 
-You can install the `requests` library using pip:
+## Installation
 
-```bash
-pip install requests
-```
+1. Clone the repository:
+    ```sh
+    git clone https://github.com/layerist/eth-price-tracker.git
+    cd eth-price-tracker
+    ```
 
-## Setup
+2. Install the required packages:
+    ```sh
+    pip install requests
+    ```
 
-1. **Clone the repository:**
-
-   ```bash
-   git clone https://github.com/layerist/eth-price-tracker.git
-   cd eth-price-tracker
-   ```
-
-2. **Get a CoinMarketCap API key:**
-
-   Sign up at [CoinMarketCap](https://coinmarketcap.com/api/) to get your API key.
-
-3. **Update the script with your API key:**
-
-   Replace `'your_api_key'` in `eth_price_tracker.py` with your actual CoinMarketCap API key.
+3. Replace `'your_api_key'` in the script with your actual CoinMarketCap API key.
 
 ## Usage
 
 Run the script:
-
-```bash
+```sh
 python eth_price_tracker.py
 ```
 
-The script will fetch and print the price of Ethereum in USD every second. To stop the script, press `Enter`.
-
-## Example Output
-
-```text
-Ethereum (ETH) price: $1800.23 USD
-Ethereum (ETH) price: $1799.87 USD
-Ethereum (ETH) price: $1801.45 USD
-...
-Press Enter to stop the script...
-```
+To stop the script, press Enter in the terminal where the script is running.
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License. See the `LICENSE` file for details.
