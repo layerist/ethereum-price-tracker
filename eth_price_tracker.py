@@ -8,7 +8,11 @@ from typing import Optional, List, Generator
 from typing_extensions import Final
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 # Constants
 API_KEY: Final = 'your_api_key'  # Replace with your actual CoinMarketCap API key
