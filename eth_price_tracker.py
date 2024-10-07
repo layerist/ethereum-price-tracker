@@ -26,44 +26,49 @@ HEADERS = {
     'X-CMC_PRO_API_KEY': API_KEY
 }
 
-last_fetched_price: Optional[float] = None
-stop_event: threading.Event = threading.Event()
-
 # Function to fetch the price of a cryptocurrency
 def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONVERT) -> Optional[float]:
-    global last_fetched_price
     params = {'symbol': symbol, 'convert': convert}
     try:
         response = requests.get(URL, headers=HEADERS, params=params)
         response.raise_for_status()  # Raise an exception for HTTP errors
         data = response.json()
         price = data['data'][symbol]['quote'][convert]['price']
-        last_fetched_price = price
         return price
+    except requests.exceptions.HTTPError as e:
+        logging.error(f"HTTP error: {e}")
     except requests.exceptions.RequestException as e:
-        logging.error(f"HTTP request error: {e}")
+        logging.error(f"Request error: {e}")
     except KeyError as e:
-        logging.error(f"Response parsing error: Missing key {e}")
+        logging.error(f"Parsing error: Missing key {e} in the response")
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-    
-    return last_fetched_price  # Return last known price if the current request fails
+        logging.error(f"Unexpected error: {e}")
+
+    return None
 
 # Function to run the price fetching loop
 def track_crypto_price(symbol: str = DEFAULT_SYMBOL, interval: int = DEFAULT_INTERVAL) -> None:
+    last_fetched_price: Optional[float] = None
+    stop_event = threading.Event()
+    
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol=symbol)
         if price:
             logging.info(f"{symbol} price: ${price:.2f} {DEFAULT_CONVERT}")
-        stop_event.wait(interval)  # More efficient than time.sleep()
+            last_fetched_price = price
+        else:
+            logging.info(f"Using last fetched price: ${last_fetched_price:.2f} {DEFAULT_CONVERT}")
+        
+        stop_event.wait(interval)
 
-# Context manager for thread management
+# Context manager for graceful shutdown of threads
 @contextmanager
 def graceful_shutdown(threads: List[threading.Thread]) -> Generator[None, None, None]:
+    stop_event = threading.Event()
     try:
         yield
     finally:
-        logging.info("Shutdown initiated. Stopping threads...")
+        logging.info("Initiating shutdown. Stopping threads...")
         stop_event.set()
         for thread in threads:
             thread.join()
