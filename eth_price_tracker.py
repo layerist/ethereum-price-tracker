@@ -30,41 +30,38 @@ HEADERS = {
 def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONVERT) -> Optional[float]:
     params = {'symbol': symbol, 'convert': convert}
     try:
-        response = requests.get(URL, headers=HEADERS, params=params)
+        response = requests.get(URL, headers=HEADERS, params=params, timeout=10)
         response.raise_for_status()  # Raise an exception for HTTP errors
         data = response.json()
         price = data['data'][symbol]['quote'][convert]['price']
         return price
-    except requests.exceptions.HTTPError as e:
-        logging.error(f"HTTP error: {e}")
     except requests.exceptions.RequestException as e:
-        logging.error(f"Request error: {e}")
+        logging.error(f"Request error for {symbol}: {e}")
     except KeyError as e:
-        logging.error(f"Parsing error: Missing key {e} in the response")
+        logging.error(f"Response parsing error: Missing key {e}")
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
-
     return None
 
 # Function to run the price fetching loop
-def track_crypto_price(symbol: str = DEFAULT_SYMBOL, interval: int = DEFAULT_INTERVAL) -> None:
+def track_crypto_price(symbol: str = DEFAULT_SYMBOL, interval: int = DEFAULT_INTERVAL, stop_event: threading.Event = None) -> None:
     last_fetched_price: Optional[float] = None
-    stop_event = threading.Event()
     
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol=symbol)
-        if price:
+        if price is not None:
             logging.info(f"{symbol} price: ${price:.2f} {DEFAULT_CONVERT}")
             last_fetched_price = price
+        elif last_fetched_price is not None:
+            logging.warning(f"Using last fetched price: ${last_fetched_price:.2f} {DEFAULT_CONVERT}")
         else:
-            logging.info(f"Using last fetched price: ${last_fetched_price:.2f} {DEFAULT_CONVERT}")
+            logging.warning("Price data unavailable.")
         
         stop_event.wait(interval)
 
 # Context manager for graceful shutdown of threads
 @contextmanager
-def graceful_shutdown(threads: List[threading.Thread]) -> Generator[None, None, None]:
-    stop_event = threading.Event()
+def graceful_shutdown(threads: List[threading.Thread], stop_event: threading.Event) -> Generator[None, None, None]:
     try:
         yield
     finally:
@@ -75,12 +72,11 @@ def graceful_shutdown(threads: List[threading.Thread]) -> Generator[None, None, 
         logging.info("All threads successfully stopped.")
 
 # Function to handle stopping the script with keyboard input
-def stop_script() -> None:
+def stop_script(stop_event: threading.Event) -> None:
     input("Press Enter to stop the script...\n")
     stop_event.set()
 
 if __name__ == "__main__":
-    # Get symbol and interval from command-line arguments, if provided
     symbol = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SYMBOL
     try:
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_INTERVAL
@@ -88,12 +84,14 @@ if __name__ == "__main__":
         logging.warning("Invalid interval provided, using default value.")
         interval = DEFAULT_INTERVAL
 
+    stop_event = threading.Event()
+    
     threads = [
-        threading.Thread(target=stop_script, daemon=True),
-        threading.Thread(target=track_crypto_price, args=(symbol, interval), daemon=True)
+        threading.Thread(target=stop_script, args=(stop_event,), daemon=True),
+        threading.Thread(target=track_crypto_price, args=(symbol, interval, stop_event), daemon=True)
     ]
 
-    with graceful_shutdown(threads):
+    with graceful_shutdown(threads, stop_event):
         for thread in threads:
             thread.start()
 
