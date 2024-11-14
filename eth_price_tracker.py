@@ -31,11 +31,9 @@ def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONV
     params = {'symbol': symbol, 'convert': convert}
     try:
         response = requests.get(URL, headers=HEADERS, params=params, timeout=10)
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        data = response.json()
-        price = data['data'][symbol]['quote'][convert]['price']
-        return price
-    except requests.exceptions.RequestException as e:
+        response.raise_for_status()
+        return response.json()['data'][symbol]['quote'][convert]['price']
+    except requests.RequestException as e:
         logging.error(f"Request error for {symbol}: {e}")
     except KeyError as e:
         logging.error(f"Response parsing error: Missing key {e}")
@@ -45,15 +43,15 @@ def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONV
 
 # Function to run the price fetching loop
 def track_crypto_price(symbol: str = DEFAULT_SYMBOL, interval: int = DEFAULT_INTERVAL, stop_event: threading.Event = None) -> None:
-    last_fetched_price: Optional[float] = None
+    last_price: Optional[float] = None
     
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol=symbol)
         if price is not None:
             logging.info(f"{symbol} price: ${price:.2f} {DEFAULT_CONVERT}")
-            last_fetched_price = price
-        elif last_fetched_price is not None:
-            logging.warning(f"Using last fetched price: ${last_fetched_price:.2f} {DEFAULT_CONVERT}")
+            last_price = price
+        elif last_price is not None:
+            logging.warning(f"Using last fetched price: ${last_price:.2f} {DEFAULT_CONVERT}")
         else:
             logging.warning("Price data unavailable.")
         
@@ -95,5 +93,4 @@ if __name__ == "__main__":
         for thread in threads:
             thread.start()
 
-        # Keep the main thread alive until all threads finish
-        stop_event.wait()
+        stop_event.wait()  # Keep the main thread alive until stop event is triggered
