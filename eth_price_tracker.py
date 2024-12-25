@@ -30,10 +30,13 @@ HEADERS = {
 def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONVERT) -> Optional[float]:
     params = {"symbol": symbol, "convert": convert}
     try:
+        logging.debug(f"Fetching price for {symbol} in {convert}...")
         response = requests.get(API_URL, headers=HEADERS, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        return data["data"][symbol]["quote"][convert]["price"]
+        price = data["data"][symbol]["quote"][convert]["price"]
+        logging.debug(f"Fetched price: {price}")
+        return price
     except requests.RequestException as e:
         logging.error(f"Request error for {symbol}: {e}")
     except KeyError as e:
@@ -44,8 +47,8 @@ def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONV
 
 # Track cryptocurrency price periodically
 def track_crypto_price(
-    symbol: str = DEFAULT_SYMBOL, 
-    interval: int = DEFAULT_INTERVAL, 
+    symbol: str = DEFAULT_SYMBOL,
+    interval: int = DEFAULT_INTERVAL,
     stop_event: threading.Event = None,
 ) -> None:
     last_price: Optional[float] = None
