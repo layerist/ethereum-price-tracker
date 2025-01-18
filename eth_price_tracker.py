@@ -90,8 +90,8 @@ if __name__ == "__main__":
         interval = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_INTERVAL
         if interval <= 0:
             raise ValueError("Interval must be a positive integer.")
-    except ValueError:
-        logging.warning("Invalid interval provided, using default value.")
+    except ValueError as e:
+        logging.warning(f"Invalid interval provided: {e}. Using default value.")
         interval = DEFAULT_INTERVAL
 
     # Initialize threading and stop event
