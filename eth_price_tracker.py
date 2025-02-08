@@ -34,23 +34,15 @@ def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONV
         response = requests.get(API_URL, headers=HEADERS, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        price = data["data"][symbol]["quote"][convert]["price"]
-        logging.debug(f"Fetched price: {price}")
-        return price
+        return data["data"].get(symbol, {}).get("quote", {}).get(convert, {}).get("price")
     except requests.RequestException as e:
         logging.error(f"Request error for {symbol}: {e}")
-    except KeyError as e:
-        logging.error(f"Response parsing error: Missing key {e}")
     except Exception as e:
         logging.error(f"Unexpected error: {e}")
     return None
 
 # Track cryptocurrency price periodically
-def track_crypto_price(
-    symbol: str = DEFAULT_SYMBOL,
-    interval: int = DEFAULT_INTERVAL,
-    stop_event: threading.Event = None,
-) -> None:
+def track_crypto_price(symbol: str, interval: int, stop_event: threading.Event) -> None:
     last_price: Optional[float] = None
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol=symbol)
@@ -65,9 +57,7 @@ def track_crypto_price(
 
 # Context manager for clean thread shutdown
 @contextmanager
-def graceful_shutdown(
-    threads: List[threading.Thread], stop_event: threading.Event
-) -> Generator[None, None, None]:
+def graceful_shutdown(threads: List[threading.Thread], stop_event: threading.Event) -> Generator[None, None, None]:
     try:
         yield
     finally:
@@ -84,17 +74,13 @@ def stop_script(stop_event: threading.Event) -> None:
 
 # Entry point
 if __name__ == "__main__":
-    # Read arguments from the command line
     symbol = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SYMBOL
     try:
-        interval = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_INTERVAL
-        if interval <= 0:
-            raise ValueError("Interval must be a positive integer.")
-    except ValueError as e:
-        logging.warning(f"Invalid interval provided: {e}. Using default value.")
+        interval = max(1, int(sys.argv[2])) if len(sys.argv) > 2 else DEFAULT_INTERVAL
+    except ValueError:
+        logging.warning("Invalid interval provided. Using default value.")
         interval = DEFAULT_INTERVAL
 
-    # Initialize threading and stop event
     stop_event = threading.Event()
     threads = [
         threading.Thread(target=stop_script, args=(stop_event,), daemon=True),
@@ -104,6 +90,4 @@ if __name__ == "__main__":
     with graceful_shutdown(threads, stop_event):
         for thread in threads:
             thread.start()
-
-        # Keep the main thread alive until the stop event is triggered
         stop_event.wait()
