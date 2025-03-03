@@ -35,10 +35,12 @@ def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONV
         response.raise_for_status()
         data = response.json()
         return data["data"].get(symbol, {}).get("quote", {}).get(convert, {}).get("price")
-    except requests.RequestException as e:
-        logging.error(f"Request error for {symbol}: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
+    except requests.exceptions.Timeout:
+        logging.error("Request timed out. Retrying...")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request error: {e}")
+    except (KeyError, TypeError) as e:
+        logging.error(f"Unexpected data format: {e}")
     return None
 
 # Track cryptocurrency price periodically
