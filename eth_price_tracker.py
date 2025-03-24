@@ -15,36 +15,37 @@ logging.basicConfig(
 )
 
 # Constants
-API_KEY: Final = "your_api_key"  # Replace with your actual CoinMarketCap API key
-API_URL: Final = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-DEFAULT_SYMBOL: Final = "ETH"
-DEFAULT_CONVERT: Final = "USD"
-DEFAULT_INTERVAL: Final = 5  # in seconds
+API_KEY: Final[str] = "your_api_key"  # Replace with your actual CoinMarketCap API key
+API_URL: Final[str] = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+DEFAULT_SYMBOL: Final[str] = "ETH"
+DEFAULT_CONVERT: Final[str] = "USD"
+DEFAULT_INTERVAL: Final[int] = 5  # in seconds
+TIMEOUT: Final[int] = 10  # API request timeout in seconds
 
 HEADERS = {
     "Accepts": "application/json",
     "X-CMC_PRO_API_KEY": API_KEY,
 }
 
-# Fetch the cryptocurrency price from the API
 def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONVERT) -> Optional[float]:
+    """Fetch the latest cryptocurrency price from the API."""
     params = {"symbol": symbol, "convert": convert}
     try:
         logging.debug(f"Fetching price for {symbol} in {convert}...")
-        response = requests.get(API_URL, headers=HEADERS, params=params, timeout=10)
+        response = requests.get(API_URL, headers=HEADERS, params=params, timeout=TIMEOUT)
         response.raise_for_status()
         data = response.json()
         return data["data"].get(symbol, {}).get("quote", {}).get(convert, {}).get("price")
-    except requests.exceptions.Timeout:
+    except requests.Timeout:
         logging.error("Request timed out. Retrying...")
-    except requests.exceptions.RequestException as e:
+    except requests.RequestException as e:
         logging.error(f"API request error: {e}")
     except (KeyError, TypeError) as e:
         logging.error(f"Unexpected data format: {e}")
     return None
 
-# Track cryptocurrency price periodically
 def track_crypto_price(symbol: str, interval: int, stop_event: threading.Event) -> None:
+    """Periodically fetch and log the cryptocurrency price."""
     last_price: Optional[float] = None
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol=symbol)
@@ -57,9 +58,9 @@ def track_crypto_price(symbol: str, interval: int, stop_event: threading.Event) 
             logging.warning("Price data unavailable.")
         stop_event.wait(interval)
 
-# Context manager for clean thread shutdown
 @contextmanager
 def graceful_shutdown(threads: List[threading.Thread], stop_event: threading.Event) -> Generator[None, None, None]:
+    """Ensure clean shutdown of threads on exit."""
     try:
         yield
     finally:
@@ -69,12 +70,11 @@ def graceful_shutdown(threads: List[threading.Thread], stop_event: threading.Eve
             thread.join()
         logging.info("All threads successfully stopped.")
 
-# Function to handle user-triggered shutdown
 def stop_script(stop_event: threading.Event) -> None:
+    """Wait for user input to stop the script."""
     input("Press Enter to stop the script...\n")
     stop_event.set()
 
-# Entry point
 if __name__ == "__main__":
     symbol = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SYMBOL
     try:
