@@ -4,56 +4,68 @@ import threading
 import logging
 import sys
 import signal
-from contextlib import contextmanager
-from typing import Optional, List, Generator
 import argparse
+from typing import Optional, List, Generator, Tuple
+from contextlib import contextmanager
 
-# Configuration Constants
-API_KEY = "your_api_key"  # Replace with your CoinMarketCap API key
+# Optional: Pretty console logs
+try:
+    from colorama import Fore, Style, init
+    init(autoreset=True)
+    COLOR_ENABLED = True
+except ImportError:
+    COLOR_ENABLED = False
+
+# Constants
+API_KEY = "your_api_key"  # Replace with your actual API key
 API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 DEFAULT_SYMBOL = "ETH"
 DEFAULT_CONVERT = "USD"
-DEFAULT_INTERVAL = 5  # seconds
-TIMEOUT = 10  # seconds
-RETRY_DELAY = 3  # seconds
-MAX_RETRIES = 3  # max retries for requests
+DEFAULT_INTERVAL = 5  # in seconds
+TIMEOUT = 10
+RETRY_DELAY = 3
+MAX_RETRIES = 3
 
 HEADERS = {
     "Accepts": "application/json",
     "X-CMC_PRO_API_KEY": API_KEY,
 }
 
-# Logging configuration
+# Logger setup
 logger = logging.getLogger("CryptoTracker")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
+stream_handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
 
 
-def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONVERT) -> Optional[float]:
+def color(text: str, color_code: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"{color_code}{text}{Style.RESET_ALL}"
+
+
+def fetch_crypto_price(symbol: str, convert: str = DEFAULT_CONVERT) -> Optional[float]:
     """
-    Fetch the latest cryptocurrency price from CoinMarketCap API with retry logic.
+    Fetch the latest cryptocurrency price from CoinMarketCap.
+    Retries on timeout/connection errors.
     """
     params = {"symbol": symbol, "convert": convert}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.debug(f"Attempt {attempt}: Fetching {symbol} price...")
+            logger.debug(f"Attempt {attempt}: fetching price for {symbol}...")
             response = requests.get(API_URL, headers=HEADERS, params=params, timeout=TIMEOUT)
             response.raise_for_status()
             data = response.json()
-            price = data["data"][symbol]["quote"][convert]["price"]
-            return price
-        except requests.Timeout:
-            logger.warning(f"Timeout on attempt {attempt}. Retrying in {RETRY_DELAY}s...")
-        except requests.ConnectionError:
-            logger.warning(f"Connection error on attempt {attempt}. Retrying in {RETRY_DELAY}s...")
+            return data["data"][symbol]["quote"][convert]["price"]
+        except (requests.Timeout, requests.ConnectionError) as e:
+            logger.warning(f"Network error on attempt {attempt}: {e}. Retrying in {RETRY_DELAY}s...")
         except requests.RequestException as e:
-            logger.error(f"Request failed: {e}")
+            logger.error(f"HTTP error: {e}")
             break
-        except (KeyError, TypeError) as e:
-            logger.error(f"Unexpected response format: {e}")
+        except (KeyError, TypeError, ValueError) as e:
+            logger.error(f"Invalid response format: {e}")
             break
         time.sleep(RETRY_DELAY)
     return None
@@ -61,79 +73,82 @@ def fetch_crypto_price(symbol: str = DEFAULT_SYMBOL, convert: str = DEFAULT_CONV
 
 def track_crypto_price(symbol: str, interval: int, stop_event: threading.Event) -> None:
     """
-    Periodically fetch and log the cryptocurrency price.
+    Continuously fetch and log crypto price at regular intervals.
     """
     last_price: Optional[float] = None
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol)
         if price is not None:
-            logger.info(f"{symbol} price: ${price:.2f} {DEFAULT_CONVERT}")
+            price_str = f"${price:.2f}"
+            msg = f"{symbol} price: {color(price_str, Fore.GREEN)} {DEFAULT_CONVERT}"
+            logger.info(msg)
             last_price = price
         else:
-            msg = f"Price unavailable. Last known: ${last_price:.2f}" if last_price else "No price data available."
-            logger.warning(msg)
+            if last_price is not None:
+                logger.warning(f"Price unavailable. Last known: ${last_price:.2f}")
+            else:
+                logger.warning("No price data available.")
         stop_event.wait(interval)
 
 
 @contextmanager
 def graceful_shutdown(threads: List[threading.Thread], stop_event: threading.Event) -> Generator[None, None, None]:
     """
-    Context manager to handle graceful shutdown of threads.
+    Context manager to ensure all threads are cleanly terminated.
     """
     try:
         yield
     finally:
-        logger.info("Stopping threads...")
+        logger.info("Stopping all threads...")
         stop_event.set()
-        for thread in threads:
-            thread.join()
-        logger.info("All threads stopped.")
+        for t in threads:
+            t.join()
+        logger.info("Shutdown complete.")
 
 
 def wait_for_exit(stop_event: threading.Event) -> None:
     """
-    Wait for user to press Enter or Ctrl+C to stop the script.
+    Waits for user to press Enter or Ctrl+C to exit.
     """
     try:
-        input("Press Enter to stop...\n")
+        input("Press Enter to exit...\n")
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt detected.")
+        logger.info("Interrupted by user.")
     finally:
         stop_event.set()
 
 
-def parse_arguments() -> tuple[str, int]:
+def parse_arguments() -> Tuple[str, int]:
     """
     Parse command-line arguments.
     """
-    parser = argparse.ArgumentParser(description="Track cryptocurrency prices in real-time.")
-    parser.add_argument("symbol", nargs="?", default=DEFAULT_SYMBOL, help="Cryptocurrency symbol (e.g., ETH, BTC)")
-    parser.add_argument("interval", nargs="?", type=int, default=DEFAULT_INTERVAL, help="Update interval in seconds")
+    parser = argparse.ArgumentParser(description="Track live cryptocurrency prices from CoinMarketCap.")
+    parser.add_argument("symbol", nargs="?", default=DEFAULT_SYMBOL, help="Symbol to track (e.g. BTC, ETH)")
+    parser.add_argument("interval", nargs="?", type=int, default=DEFAULT_INTERVAL, help="Polling interval (seconds)")
     args = parser.parse_args()
     return args.symbol.upper(), max(1, args.interval)
 
 
 def setup_signal_handlers(stop_event: threading.Event) -> None:
     """
-    Setup signal handlers for graceful termination.
+    Attach handlers to OS signals for graceful termination.
     """
-    def handle_signal(signum, frame):
+    def signal_handler(signum, frame):
         logger.info(f"Signal {signum} received. Exiting...")
         stop_event.set()
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
 
 def main() -> None:
     symbol, interval = parse_arguments()
     stop_event = threading.Event()
-
     setup_signal_handlers(stop_event)
 
     threads = [
         threading.Thread(target=track_crypto_price, args=(symbol, interval, stop_event), name="PriceTracker", daemon=True),
-        threading.Thread(target=wait_for_exit, args=(stop_event,), name="InputThread", daemon=True)
+        threading.Thread(target=wait_for_exit, args=(stop_event,), name="InputListener", daemon=True),
     ]
 
     with graceful_shutdown(threads, stop_event):
