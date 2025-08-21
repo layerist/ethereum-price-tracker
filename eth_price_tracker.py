@@ -5,33 +5,35 @@ import logging
 import sys
 import signal
 import argparse
-from typing import Optional, List, Generator
+import random
+from typing import Optional, Generator
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
-# Try to import colorama for colored output
-try:
-    from colorama import Fore, Style, init
-    init(autoreset=True)
-    COLOR_ENABLED = True
-except ImportError:
-    COLOR_ENABLED = False
-
-# Config
+# --- Config ---
 API_KEY = "your_api_key"
 API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+
 DEFAULT_SYMBOLS = ["ETH"]
 DEFAULT_CONVERT = "USD"
-DEFAULT_INTERVAL = 5
+DEFAULT_INTERVAL = 5  # seconds
 TIMEOUT = 10
 MAX_RETRIES = 3
-RETRY_BASE_DELAY = 3
+RETRY_BASE_DELAY = 2
 MAX_BACKOFF = 30
 
 HEADERS = {
     "Accepts": "application/json",
     "X-CMC_PRO_API_KEY": API_KEY,
 }
+
+# --- Optional colored output ---
+try:
+    from colorama import Fore, Style, init
+    init(autoreset=True)
+    COLOR_ENABLED = True
+except ImportError:
+    COLOR_ENABLED = False
 
 
 def setup_logger() -> logging.Logger:
@@ -50,16 +52,20 @@ def colorize(text: str, color_code: str) -> str:
     return f"{color_code}{text}{Style.RESET_ALL}" if COLOR_ENABLED else text
 
 
+session = requests.Session()
+session.headers.update(HEADERS)
+
+
 def fetch_crypto_price(symbol: str, convert: str) -> Optional[float]:
     params = {"symbol": symbol, "convert": convert}
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             logger.debug(f"[{symbol}] Fetching price (attempt {attempt})...")
-            response = requests.get(API_URL, headers=HEADERS, params=params, timeout=TIMEOUT)
+            response = session.get(API_URL, params=params, timeout=TIMEOUT)
             response.raise_for_status()
             return response.json()["data"][symbol]["quote"][convert]["price"]
         except (requests.Timeout, requests.ConnectionError) as e:
-            delay = min(RETRY_BASE_DELAY ** attempt, MAX_BACKOFF)
+            delay = min(RETRY_BASE_DELAY ** attempt + random.uniform(0, 1), MAX_BACKOFF)
             logger.warning(f"[{symbol}] Network error: {e}. Retrying in {delay:.1f}s...")
             time.sleep(delay)
         except (KeyError, ValueError) as e:
@@ -86,17 +92,15 @@ def track_price(symbol: str, convert: str, interval: int, stop_event: threading.
             logger.info(f"[{symbol}] Price: {colorize(price_str, color_code)} {convert}")
             last_price = price
         else:
-            if last_price:
-                logger.warning(f"[{symbol}] Price unavailable. Last known: ${last_price:,.2f}")
-            else:
-                logger.warning(f"[{symbol}] No price data available.")
+            msg = f"Price unavailable. Last known: ${last_price:,.2f}" if last_price else "No price data available."
+            logger.warning(f"[{symbol}] {msg}")
         stop_event.wait(interval)
 
 
 def wait_for_exit(stop_event: threading.Event) -> None:
     try:
         input("Press Enter to exit...\n")
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         logger.info("Interrupted by user.")
     finally:
         stop_event.set()
@@ -109,7 +113,7 @@ def graceful_shutdown(executor: ThreadPoolExecutor, stop_event: threading.Event)
     finally:
         logger.info("Shutting down...")
         stop_event.set()
-        executor.shutdown(wait=True)
+        executor.shutdown(wait=True, cancel_futures=True)
         logger.info("All tasks completed. Exiting.")
 
 
@@ -131,6 +135,9 @@ def parse_args():
 
     if args.debug:
         logger.setLevel(logging.DEBUG)
+        requests_log = logging.getLogger("requests.packages.urllib3")
+        requests_log.setLevel(logging.DEBUG)
+        requests_log.propagate = True
 
     return [s.upper() for s in args.symbols], args.convert.upper(), max(1, args.interval)
 
