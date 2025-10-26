@@ -38,17 +38,24 @@ except ImportError:
     COLOR_ENABLED = False
 
 
-def colorize(text: str, color_code: str) -> str:
-    return f"{color_code}{text}{Style.RESET_ALL}" if COLOR_ENABLED else text
+def colorize(text: str, color: str) -> str:
+    return f"{color}{text}{Style.RESET_ALL}" if COLOR_ENABLED else text
 
 
-def setup_logger() -> logging.Logger:
+def setup_logger(debug: bool = False) -> logging.Logger:
+    """Configure and return a logger."""
     logger = logging.getLogger("CryptoTracker")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+
     handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter("%(asctime)s [%(threadName)s] - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(threadName)s] - %(levelname)s - %(message)s"))
+
+    # Avoid adding multiple handlers if already configured
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+    # Suppress noisy logs from dependencies
+    logging.getLogger("requests").setLevel(logging.WARNING)
     return logger
 
 
@@ -59,31 +66,30 @@ session.headers.update(HEADERS)
 
 
 def exponential_backoff(attempt: int) -> float:
-    """Return delay time with exponential backoff and jitter."""
-    delay = min(RETRY_BASE_DELAY ** attempt + random.uniform(0, 1), MAX_BACKOFF)
-    return delay
+    """Return an exponential backoff delay with jitter."""
+    return min(RETRY_BASE_DELAY ** attempt + random.random(), MAX_BACKOFF)
 
 
 def fetch_crypto_price(symbol: str, convert: str) -> Optional[float]:
-    """Fetch current price for a symbol with retry and exponential backoff."""
+    """Fetch current price for a given symbol, retrying on transient errors."""
     params = {"symbol": symbol, "convert": convert}
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            start_time = time.perf_counter()
-            response = session.get(API_URL, params=params, timeout=TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
+            start = time.perf_counter()
+            resp = session.get(API_URL, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
 
+            data = resp.json()
             price = data["data"][symbol]["quote"][convert]["price"]
-            elapsed = time.perf_counter() - start_time
-            logger.debug(f"[{symbol}] Fetched in {elapsed:.2f}s (attempt {attempt})")
 
+            elapsed = time.perf_counter() - start
+            logger.debug(f"[{symbol}] Response in {elapsed:.2f}s (attempt {attempt})")
             return price
 
         except (requests.Timeout, requests.ConnectionError) as e:
             delay = exponential_backoff(attempt)
-            logger.warning(f"[{symbol}] Network error: {e}. Retrying in {delay:.1f}s...")
+            logger.warning(f"[{symbol}] Network error ({e}). Retrying in {delay:.1f}s...")
             time.sleep(delay)
 
         except (KeyError, ValueError) as e:
@@ -91,40 +97,38 @@ def fetch_crypto_price(symbol: str, convert: str) -> Optional[float]:
             break
 
         except requests.RequestException as e:
-            status_code = getattr(e.response, "status_code", "N/A")
-            logger.error(f"[{symbol}] HTTP error {status_code}: {e}")
+            status = getattr(e.response, "status_code", "N/A")
+            logger.error(f"[{symbol}] HTTP error {status}: {e}")
             break
 
     return None
 
 
 def track_price(symbol: str, convert: str, interval: int, stop_event: threading.Event) -> None:
-    """Continuously fetch and log price updates for a symbol."""
+    """Continuously fetch and display price updates."""
     last_price = None
-    thread_name = threading.current_thread().name
-    logger.info(f"[{symbol}] Tracking started on {thread_name}")
+    logger.info(f"[{symbol}] Tracking started.")
 
     while not stop_event.is_set():
         price = fetch_crypto_price(symbol, convert)
 
         if price is not None:
-            price_str = f"${price:,.2f}"
-            color_code = Fore.YELLOW
-
+            diff_color = Fore.YELLOW
             if last_price is not None:
                 if price > last_price:
-                    color_code = Fore.GREEN
+                    diff_color = Fore.GREEN
                 elif price < last_price:
-                    color_code = Fore.RED
+                    diff_color = Fore.RED
 
-            logger.info(f"[{symbol}] Price: {colorize(price_str, color_code)} {convert}")
+            price_str = f"${price:,.2f}"
+            logger.info(f"[{symbol}] Price: {colorize(price_str, diff_color)} {convert}")
             last_price = price
 
         else:
+            msg = f"[{symbol}] Price unavailable."
             if last_price is not None:
-                logger.warning(f"[{symbol}] Price unavailable. Last known: ${last_price:,.2f}")
-            else:
-                logger.warning(f"[{symbol}] No price data available.")
+                msg += f" Last known: ${last_price:,.2f}"
+            logger.warning(msg)
 
         stop_event.wait(interval)
 
@@ -132,60 +136,60 @@ def track_price(symbol: str, convert: str, interval: int, stop_event: threading.
 
 
 def wait_for_exit(stop_event: threading.Event) -> None:
-    """Wait for user to press Enter or handle interruption."""
+    """Block until user requests exit or signal is received."""
     try:
         if sys.stdin.isatty():
             input("Press Enter to exit...\n")
         else:
             stop_event.wait()
     except (KeyboardInterrupt, EOFError):
-        logger.info("Interrupted by user.")
+        logger.info("Exit requested by user.")
     finally:
         stop_event.set()
 
 
 @contextmanager
 def graceful_shutdown(executor: ThreadPoolExecutor, stop_event: threading.Event) -> Generator:
-    """Ensure clean shutdown on exit."""
+    """Ensure clean shutdown of all threads."""
     try:
         yield
     finally:
-        logger.info("Shutting down gracefully...")
+        logger.info("Shutting down...")
         stop_event.set()
         executor.shutdown(wait=True, cancel_futures=True)
-        logger.info("All tasks completed. Exiting.")
+        logger.info("All threads finished.")
 
 
 def setup_signal_handlers(stop_event: threading.Event) -> None:
-    def handle_signal(signum, _frame):
-        logger.info(f"Signal {signum} received. Stopping...")
+    """Handle SIGINT/SIGTERM for clean exit."""
+    def handler(signum, _frame):
+        logger.info(f"Signal {signum} received. Terminating...")
         stop_event.set()
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, handler)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Track live cryptocurrency prices via CoinMarketCap API.")
-    parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS, help="Symbols to track (e.g. BTC ETH)")
-    parser.add_argument("--convert", default=DEFAULT_CONVERT, help="Currency to convert to (e.g. USD)")
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="Polling interval (seconds)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS, help="Symbols to track (e.g., BTC ETH)")
+    parser.add_argument("--convert", default=DEFAULT_CONVERT, help="Currency to convert to (default: USD)")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="Polling interval in seconds")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+
     args = parser.parse_args()
 
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-        logging.getLogger("requests").setLevel(logging.WARNING)
-
     if not API_KEY or API_KEY == "your_api_key":
-        logger.error("Missing CoinMarketCap API key. Please set API_KEY before running.")
-        sys.exit(1)
+        sys.exit("Error: Please set your CoinMarketCap API key in the script.")
 
-    return [s.upper() for s in args.symbols], args.convert.upper(), max(1, args.interval)
+    return [s.upper() for s in args.symbols], args.convert.upper(), max(1, args.interval), args.debug
 
 
 def main():
-    symbols, convert, interval = parse_args()
+    symbols, convert, interval, debug = parse_args()
+    global logger
+    logger = setup_logger(debug)
+
     stop_event = threading.Event()
     setup_signal_handlers(stop_event)
 
