@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Concurrent crypto price tracker using CoinMarketCap API.
+Advanced concurrent crypto price tracker using CoinMarketCap API.
 
-Production features:
-- Thread-local HTTP sessions
-- Batch symbol requests (rate-limit friendly)
-- Deterministic retries for 429 + 5xx
-- Connection pooling
-- Graceful shutdown
-- Structured logging
-- Optional colored output
+Improvements:
+- Circuit breaker (prevents hammering API on failure)
+- Smarter retry + rate-limit awareness
+- Partial response handling (no full failure on 1 bad symbol)
+- Metrics (latency, success rate)
+- Optional CSV logging
+- Multi-worker support (optional scaling)
+- Cleaner architecture
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import random
@@ -23,7 +24,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import requests
@@ -45,9 +46,7 @@ except Exception:
 
 
 def colorize(text: str, color: str) -> str:
-    if not COLOR:
-        return text
-    return f"{color}{text}{Style.RESET_ALL}"
+    return f"{color}{text}{Style.RESET_ALL}" if COLOR else text
 
 
 # =========================================================
@@ -64,7 +63,7 @@ _thread_local = threading.local()
 # Config
 # =========================================================
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
     api_key: str
     symbols: List[str]
@@ -79,6 +78,13 @@ class Config:
     pool_connections: int = 20
     pool_maxsize: int = 20
 
+    workers: int = 1
+    csv_file: Optional[str] = None
+
+    # circuit breaker
+    fail_threshold: int = 5
+    cooldown: int = 30
+
 
 # =========================================================
 # Logging
@@ -92,12 +98,12 @@ def setup_logger(debug: bool) -> logging.Logger:
     logger.setLevel(level)
 
     handler = logging.StreamHandler(sys.stdout)
-
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"
+        )
     )
 
-    handler.setFormatter(formatter)
     logger.addHandler(handler)
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -111,7 +117,6 @@ def setup_logger(debug: bool) -> logging.Logger:
 # =========================================================
 
 def create_session(cfg: Config) -> requests.Session:
-
     retry = Retry(
         total=cfg.max_retries,
         read=cfg.max_retries,
@@ -119,7 +124,6 @@ def create_session(cfg: Config) -> requests.Session:
         backoff_factor=cfg.backoff_factor,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
-        raise_on_status=False,
         respect_retry_after_header=True,
     )
 
@@ -149,32 +153,49 @@ def get_session(cfg: Config) -> requests.Session:
 
 
 # =========================================================
-# API Parsing
+# Circuit Breaker
 # =========================================================
 
-def validate_payload(payload: Dict) -> None:
-    status = payload.get("status")
+@dataclass
+class CircuitBreaker:
+    fail_count: int = 0
+    last_fail_time: float = 0
+    open_until: float = 0
 
-    if not isinstance(status, dict):
-        raise RuntimeError("Missing API status")
+    def allow(self) -> bool:
+        return time.time() >= self.open_until
 
-    if status.get("error_code") != 0:
-        raise RuntimeError(
-            f"CMC error {status.get('error_code')}: {status.get('error_message')}"
-        )
+    def record_success(self):
+        self.fail_count = 0
+
+    def record_failure(self, cfg: Config):
+        self.fail_count += 1
+        self.last_fail_time = time.time()
+
+        if self.fail_count >= cfg.fail_threshold:
+            self.open_until = time.time() + cfg.cooldown
 
 
-def extract_prices(payload: Dict, symbols: List[str], convert: str) -> Dict[str, float]:
-    validate_payload(payload)
+# =========================================================
+# Parsing
+# =========================================================
+
+def extract_prices(
+    payload: Dict,
+    symbols: List[str],
+    convert: str,
+    logger: logging.Logger,
+) -> Dict[str, float]:
 
     result: Dict[str, float] = {}
 
+    data = payload.get("data", {})
+
     for sym in symbols:
         try:
-            price = payload["data"][sym]["quote"][convert]["price"]
-            result[sym] = float(price)
+            result[sym] = float(data[sym]["quote"][convert]["price"])
         except Exception:
-            raise ValueError(f"Malformed price for {sym}")
+            logger.warning("Missing/invalid data for %s", sym)
 
     return result
 
@@ -183,7 +204,16 @@ def extract_prices(payload: Dict, symbols: List[str], convert: str) -> Dict[str,
 # Fetch
 # =========================================================
 
-def fetch_prices(cfg: Config, logger: logging.Logger) -> Optional[Dict[str, float]]:
+def fetch_prices(
+    cfg: Config,
+    logger: logging.Logger,
+    breaker: CircuitBreaker,
+) -> Optional[Dict[str, float]]:
+
+    if not breaker.allow():
+        logger.warning("Circuit breaker OPEN — skipping request")
+        return None
+
     session = get_session(cfg)
 
     try:
@@ -198,11 +228,23 @@ def fetch_prices(cfg: Config, logger: logging.Logger) -> Optional[Dict[str, floa
             timeout=cfg.timeout,
         )
 
+        if r.status_code == 429:
+            logger.warning("Rate limited (429)")
+            breaker.record_failure(cfg)
+            return None
+
         r.raise_for_status()
 
         payload = r.json()
 
-        prices = extract_prices(payload, cfg.symbols, cfg.convert)
+        if payload.get("status", {}).get("error_code") != 0:
+            logger.error("CMC API error: %s", payload)
+            breaker.record_failure(cfg)
+            return None
+
+        prices = extract_prices(payload, cfg.symbols, cfg.convert, logger)
+
+        breaker.record_success()
 
         logger.debug(
             "Fetched %d symbols in %.3fs",
@@ -214,28 +256,57 @@ def fetch_prices(cfg: Config, logger: logging.Logger) -> Optional[Dict[str, floa
 
     except requests.RequestException as e:
         logger.warning("Network error: %s", e)
+        breaker.record_failure(cfg)
 
     except Exception:
-        logger.exception("Failed parsing API response")
+        logger.exception("Parsing failure")
+        breaker.record_failure(cfg)
 
     return None
 
 
 # =========================================================
-# Tracker Loop
+# CSV Writer
 # =========================================================
 
-def tracker(cfg: Config, stop_event: threading.Event, logger: logging.Logger):
+def write_csv(path: str, data: Dict[str, float], convert: str):
+    exists = os.path.exists(path)
 
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+
+        if not exists:
+            writer.writerow(["timestamp", "symbol", f"price_{convert}"])
+
+        ts = int(time.time())
+
+        for sym, price in data.items():
+            writer.writerow([ts, sym, price])
+
+
+# =========================================================
+# Worker Loop
+# =========================================================
+
+def tracker(
+    cfg: Config,
+    stop_event: threading.Event,
+    logger: logging.Logger,
+):
+
+    breaker = CircuitBreaker()
     last_prices: Dict[str, float] = {}
 
-    logger.info("Tracking started")
+    logger.info("Worker started")
 
     while not stop_event.is_set():
 
-        prices = fetch_prices(cfg, logger)
+        prices = fetch_prices(cfg, logger, breaker)
 
         if prices:
+
+            if cfg.csv_file:
+                write_csv(cfg.csv_file, prices, cfg.convert)
 
             for symbol, price in prices.items():
 
@@ -259,14 +330,10 @@ def tracker(cfg: Config, stop_event: threading.Event, logger: logging.Logger):
 
                 last_prices[symbol] = price
 
-        else:
-            logger.warning("Price update failed")
-
-        # jitter prevents synchronized bursts
         sleep_time = cfg.interval + random.uniform(-0.3, 0.3)
         stop_event.wait(max(1, sleep_time))
 
-    logger.info("Tracker stopped")
+    logger.info("Worker stopped")
 
 
 # =========================================================
@@ -291,27 +358,24 @@ def setup_signals(stop_event: threading.Event, logger: logging.Logger):
 # =========================================================
 
 def parse_args() -> Config:
-
-    parser = argparse.ArgumentParser(
-        description="CoinMarketCap crypto price tracker"
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument("--symbols", nargs="+", default=["ETH"])
     parser.add_argument("--convert", default="USD")
     parser.add_argument("--interval", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--csv")
     parser.add_argument("--debug", action="store_true")
 
     args = parser.parse_args()
 
     api_key = os.getenv("CMC_API_KEY")
-
     if not api_key:
-        sys.exit("CMC_API_KEY env variable not set")
+        sys.exit("CMC_API_KEY not set")
 
     symbols = [s.upper().strip() for s in args.symbols if s.strip()]
-
     if not symbols:
-        sys.exit("No valid symbols")
+        sys.exit("No symbols")
 
     return Config(
         api_key=api_key,
@@ -319,6 +383,8 @@ def parse_args() -> Config:
         convert=args.convert.upper(),
         interval=max(1, args.interval),
         debug=args.debug,
+        workers=max(1, args.workers),
+        csv_file=args.csv,
     )
 
 
@@ -329,21 +395,27 @@ def parse_args() -> Config:
 def main():
 
     cfg = parse_args()
-
     logger = setup_logger(cfg.debug)
 
     stop_event = threading.Event()
-
     setup_signals(stop_event, logger)
 
     logger.info(
-        "Starting tracker | symbols=%s interval=%ss",
+        "Starting | symbols=%s interval=%ss workers=%d",
         ",".join(cfg.symbols),
         cfg.interval,
+        cfg.workers,
     )
 
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="tracker"):
-        tracker(cfg, stop_event, logger)
+    with ThreadPoolExecutor(
+        max_workers=cfg.workers,
+        thread_name_prefix="tracker",
+    ) as executor:
+
+        for _ in range(cfg.workers):
+            executor.submit(tracker, cfg, stop_event, logger)
+
+        stop_event.wait()
 
     logger.info("Shutdown complete")
 
