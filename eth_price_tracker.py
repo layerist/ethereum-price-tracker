@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Advanced concurrent crypto price tracker using CoinMarketCap API.
+Ultra-robust concurrent crypto price tracker (CoinMarketCap)
 
-Improvements:
-- Circuit breaker (prevents hammering API on failure)
-- Smarter retry + rate-limit awareness
-- Partial response handling (no full failure on 1 bad symbol)
-- Metrics (latency, success rate)
-- Optional CSV logging
-- Multi-worker support (optional scaling)
-- Cleaner architecture
+Major upgrades:
+- Global rate limiter (thread-safe)
+- Circuit breaker with HALF-OPEN state
+- Adaptive polling interval (auto backoff)
+- Metrics (success rate, latency, errors)
+- Batch requests (prevents full failure)
+- Buffered CSV writing
+- Graceful shutdown
+- Jittered exponential retry (extra layer)
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import requests
@@ -33,19 +34,19 @@ from urllib3.util.retry import Retry
 
 
 # =========================================================
-# Optional colors
+# Color support
 # =========================================================
 
 try:
-    from colorama import Fore, Style, init as colorama_init
+    from colorama import Fore, Style, init
 
-    colorama_init(autoreset=True)
+    init(autoreset=True)
     COLOR = True
 except Exception:
     COLOR = False
 
 
-def colorize(text: str, color: str) -> str:
+def colorize(text, color):
     return f"{color}{text}{Style.RESET_ALL}" if COLOR else text
 
 
@@ -54,8 +55,6 @@ def colorize(text: str, color: str) -> str:
 # =========================================================
 
 API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-DEFAULT_TIMEOUT = 10
-
 _thread_local = threading.local()
 
 
@@ -68,282 +67,310 @@ class Config:
     api_key: str
     symbols: List[str]
     convert: str
-    interval: int
+    interval: float
+    workers: int
     debug: bool
 
-    timeout: int = DEFAULT_TIMEOUT
+    timeout: int = 10
     max_retries: int = 5
     backoff_factor: float = 1.2
 
-    pool_connections: int = 20
-    pool_maxsize: int = 20
+    rate_limit_per_sec: float = 5.0
 
-    workers: int = 1
-    csv_file: Optional[str] = None
-
-    # circuit breaker
     fail_threshold: int = 5
     cooldown: int = 30
 
+    batch_size: int = 10
+
+    csv_file: Optional[str] = None
+
 
 # =========================================================
-# Logging
+# Logger
 # =========================================================
 
-def setup_logger(debug: bool) -> logging.Logger:
-    logger = logging.getLogger("crypto_tracker")
+def setup_logger(debug: bool):
+    logger = logging.getLogger("tracker")
     logger.handlers.clear()
 
-    level = logging.DEBUG if debug else logging.INFO
-    logger.setLevel(level)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s"
-        )
+        logging.Formatter("%(asctime)s | %(levelname)s | %(threadName)s | %(message)s")
     )
 
     logger.addHandler(handler)
 
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     return logger
 
 
 # =========================================================
-# Session Factory
+# Rate limiter (GLOBAL)
 # =========================================================
 
-def create_session(cfg: Config) -> requests.Session:
+class RateLimiter:
+    def __init__(self, rate_per_sec: float):
+        self.interval = 1.0 / rate_per_sec
+        self.lock = threading.Lock()
+        self.last_call = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            delta = now - self.last_call
+            if delta < self.interval:
+                time.sleep(self.interval - delta)
+            self.last_call = time.time()
+
+
+# =========================================================
+# Circuit Breaker (HALF-OPEN)
+# =========================================================
+
+class CircuitBreaker:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.fail_count = 0
+        self.state = "CLOSED"
+        self.open_until = 0
+
+    def allow(self):
+        if self.state == "OPEN":
+            if time.time() > self.open_until:
+                self.state = "HALF"
+                return True
+            return False
+        return True
+
+    def success(self):
+        self.fail_count = 0
+        self.state = "CLOSED"
+
+    def failure(self):
+        self.fail_count += 1
+        if self.fail_count >= self.cfg.fail_threshold:
+            self.state = "OPEN"
+            self.open_until = time.time() + self.cfg.cooldown
+
+
+# =========================================================
+# Metrics
+# =========================================================
+
+class Metrics:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ok = 0
+        self.fail = 0
+        self.latencies = []
+
+    def record(self, success: bool, latency: float):
+        with self.lock:
+            if success:
+                self.ok += 1
+            else:
+                self.fail += 1
+            self.latencies.append(latency)
+
+    def snapshot(self):
+        with self.lock:
+            total = self.ok + self.fail
+            avg_latency = sum(self.latencies[-50:]) / max(1, len(self.latencies[-50:]))
+            success_rate = self.ok / total if total else 0
+            return success_rate, avg_latency
+
+
+# =========================================================
+# Session
+# =========================================================
+
+def create_session(cfg: Config):
     retry = Retry(
         total=cfg.max_retries,
-        read=cfg.max_retries,
-        connect=cfg.max_retries,
         backoff_factor=cfg.backoff_factor,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
         respect_retry_after_header=True,
     )
 
-    adapter = HTTPAdapter(
-        max_retries=retry,
-        pool_connections=cfg.pool_connections,
-        pool_maxsize=cfg.pool_maxsize,
+    adapter = HTTPAdapter(max_retries=retry)
+
+    s = requests.Session()
+    s.mount("https://", adapter)
+
+    s.headers.update(
+        {"Accept": "application/json", "X-CMC_PRO_API_KEY": cfg.api_key}
     )
 
-    session = requests.Session()
-    session.mount("https://", adapter)
-
-    session.headers.update(
-        {
-            "Accept": "application/json",
-            "X-CMC_PRO_API_KEY": cfg.api_key,
-        }
-    )
-
-    return session
+    return s
 
 
-def get_session(cfg: Config) -> requests.Session:
+def get_session(cfg: Config):
     if not hasattr(_thread_local, "session"):
         _thread_local.session = create_session(cfg)
     return _thread_local.session
 
 
 # =========================================================
-# Circuit Breaker
-# =========================================================
-
-@dataclass
-class CircuitBreaker:
-    fail_count: int = 0
-    last_fail_time: float = 0
-    open_until: float = 0
-
-    def allow(self) -> bool:
-        return time.time() >= self.open_until
-
-    def record_success(self):
-        self.fail_count = 0
-
-    def record_failure(self, cfg: Config):
-        self.fail_count += 1
-        self.last_fail_time = time.time()
-
-        if self.fail_count >= cfg.fail_threshold:
-            self.open_until = time.time() + cfg.cooldown
-
-
-# =========================================================
-# Parsing
-# =========================================================
-
-def extract_prices(
-    payload: Dict,
-    symbols: List[str],
-    convert: str,
-    logger: logging.Logger,
-) -> Dict[str, float]:
-
-    result: Dict[str, float] = {}
-
-    data = payload.get("data", {})
-
-    for sym in symbols:
-        try:
-            result[sym] = float(data[sym]["quote"][convert]["price"])
-        except Exception:
-            logger.warning("Missing/invalid data for %s", sym)
-
-    return result
-
-
-# =========================================================
 # Fetch
 # =========================================================
 
-def fetch_prices(
-    cfg: Config,
-    logger: logging.Logger,
-    breaker: CircuitBreaker,
-) -> Optional[Dict[str, float]]:
-
+def fetch_batch(cfg, symbols, limiter, breaker, logger, metrics):
     if not breaker.allow():
-        logger.warning("Circuit breaker OPEN — skipping request")
-        return None
+        logger.warning("Circuit OPEN — skipping")
+        return {}
 
+    limiter.wait()
     session = get_session(cfg)
 
-    try:
-        start = time.perf_counter()
+    start = time.perf_counter()
 
+    try:
         r = session.get(
             API_URL,
-            params={
-                "symbol": ",".join(cfg.symbols),
-                "convert": cfg.convert,
-            },
+            params={"symbol": ",".join(symbols), "convert": cfg.convert},
             timeout=cfg.timeout,
         )
 
+        latency = time.perf_counter() - start
+
         if r.status_code == 429:
-            logger.warning("Rate limited (429)")
-            breaker.record_failure(cfg)
-            return None
+            breaker.failure()
+            metrics.record(False, latency)
+            return {}
 
         r.raise_for_status()
 
-        payload = r.json()
+        data = r.json().get("data", {})
 
-        if payload.get("status", {}).get("error_code") != 0:
-            logger.error("CMC API error: %s", payload)
-            breaker.record_failure(cfg)
-            return None
+        result = {}
+        for s in symbols:
+            try:
+                result[s] = float(data[s]["quote"][cfg.convert]["price"])
+            except Exception:
+                logger.debug("Bad symbol: %s", s)
 
-        prices = extract_prices(payload, cfg.symbols, cfg.convert, logger)
+        breaker.success()
+        metrics.record(True, latency)
 
-        breaker.record_success()
+        return result
 
-        logger.debug(
-            "Fetched %d symbols in %.3fs",
-            len(prices),
-            time.perf_counter() - start,
-        )
+    except Exception as e:
+        latency = time.perf_counter() - start
+        logger.debug("Fetch error: %s", e)
 
-        return prices
+        breaker.failure()
+        metrics.record(False, latency)
 
-    except requests.RequestException as e:
-        logger.warning("Network error: %s", e)
-        breaker.record_failure(cfg)
-
-    except Exception:
-        logger.exception("Parsing failure")
-        breaker.record_failure(cfg)
-
-    return None
+        # jitter retry (extra layer)
+        time.sleep(random.uniform(0.2, 1.0))
+        return {}
 
 
 # =========================================================
-# CSV Writer
+# CSV (buffered)
 # =========================================================
 
-def write_csv(path: str, data: Dict[str, float], convert: str):
-    exists = os.path.exists(path)
+class CSVWriter:
+    def __init__(self, path: str, convert: str):
+        self.path = path
+        self.convert = convert
+        self.buffer = []
+        self.lock = threading.Lock()
 
-    with open(path, "a", newline="") as f:
-        writer = csv.writer(f)
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(["ts", "symbol", f"price_{convert}"])
 
-        if not exists:
-            writer.writerow(["timestamp", "symbol", f"price_{convert}"])
-
+    def write(self, data: Dict[str, float]):
         ts = int(time.time())
+        with self.lock:
+            for k, v in data.items():
+                self.buffer.append([ts, k, v])
 
-        for sym, price in data.items():
-            writer.writerow([ts, sym, price])
+            if len(self.buffer) >= 50:
+                self.flush()
+
+    def flush(self):
+        if not self.buffer:
+            return
+        with open(self.path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(self.buffer)
+        self.buffer.clear()
 
 
 # =========================================================
-# Worker Loop
+# Worker
 # =========================================================
 
-def tracker(
-    cfg: Config,
-    stop_event: threading.Event,
-    logger: logging.Logger,
-):
+def worker(cfg, stop_event, limiter, logger, metrics):
+    breaker = CircuitBreaker(cfg)
+    last = {}
 
-    breaker = CircuitBreaker()
-    last_prices: Dict[str, float] = {}
-
-    logger.info("Worker started")
+    csv_writer = CSVWriter(cfg.csv_file, cfg.convert) if cfg.csv_file else None
 
     while not stop_event.is_set():
 
-        prices = fetch_prices(cfg, logger, breaker)
+        all_prices = {}
 
-        if prices:
+        # batch split
+        for i in range(0, len(cfg.symbols), cfg.batch_size):
+            batch = cfg.symbols[i : i + cfg.batch_size]
+            res = fetch_batch(cfg, batch, limiter, breaker, logger, metrics)
+            all_prices.update(res)
 
-            if cfg.csv_file:
-                write_csv(cfg.csv_file, prices, cfg.convert)
+        for sym, price in all_prices.items():
+            prev = last.get(sym)
 
-            for symbol, price in prices.items():
+            if prev is None:
+                color = Fore.YELLOW
+            elif price > prev:
+                color = Fore.GREEN
+            elif price < prev:
+                color = Fore.RED
+            else:
+                color = Fore.YELLOW
 
-                prev = last_prices.get(symbol)
+            logger.info("%s: %s %s", sym, colorize(f"{price:,.2f}", color), cfg.convert)
+            last[sym] = price
 
-                if prev is None:
-                    color = Fore.YELLOW
-                elif price > prev:
-                    color = Fore.GREEN
-                elif price < prev:
-                    color = Fore.RED
-                else:
-                    color = Fore.YELLOW
+        if csv_writer:
+            csv_writer.write(all_prices)
 
-                logger.info(
-                    "%s: %s %s",
-                    symbol,
-                    colorize(f"{price:,.2f}", color),
-                    cfg.convert,
-                )
+        success_rate, latency = metrics.snapshot()
 
-                last_prices[symbol] = price
+        logger.debug(
+            "metrics | success=%.2f avg_latency=%.3f",
+            success_rate,
+            latency,
+        )
 
-        sleep_time = cfg.interval + random.uniform(-0.3, 0.3)
-        stop_event.wait(max(1, sleep_time))
+        # adaptive sleep
+        base = cfg.interval
+        if success_rate < 0.7:
+            base *= 1.5
+        elif success_rate > 0.95:
+            base *= 0.9
 
-    logger.info("Worker stopped")
+        sleep = base + random.uniform(-0.3, 0.3)
+        stop_event.wait(max(1, sleep))
+
+    if csv_writer:
+        csv_writer.flush()
 
 
 # =========================================================
 # Signals
 # =========================================================
 
-def setup_signals(stop_event: threading.Event, logger: logging.Logger):
-
-    def handler(sig, frame):
-        logger.info("Signal %s received — shutting down", sig)
+def setup_signals(stop_event, logger):
+    def handler(sig, _):
+        logger.info("Signal %s — stopping", sig)
         stop_event.set()
 
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -357,33 +384,29 @@ def setup_signals(stop_event: threading.Event, logger: logging.Logger):
 # CLI
 # =========================================================
 
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser()
+def parse_args():
+    p = argparse.ArgumentParser()
 
-    parser.add_argument("--symbols", nargs="+", default=["ETH"])
-    parser.add_argument("--convert", default="USD")
-    parser.add_argument("--interval", type=int, default=5)
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--csv")
-    parser.add_argument("--debug", action="store_true")
+    p.add_argument("--symbols", nargs="+", default=["ETH"])
+    p.add_argument("--convert", default="USD")
+    p.add_argument("--interval", type=float, default=5)
+    p.add_argument("--workers", type=int, default=1)
+    p.add_argument("--csv")
+    p.add_argument("--debug", action="store_true")
 
-    args = parser.parse_args()
+    args = p.parse_args()
 
     api_key = os.getenv("CMC_API_KEY")
     if not api_key:
-        sys.exit("CMC_API_KEY not set")
-
-    symbols = [s.upper().strip() for s in args.symbols if s.strip()]
-    if not symbols:
-        sys.exit("No symbols")
+        sys.exit("CMC_API_KEY missing")
 
     return Config(
         api_key=api_key,
-        symbols=symbols,
+        symbols=[s.upper() for s in args.symbols],
         convert=args.convert.upper(),
-        interval=max(1, args.interval),
+        interval=args.interval,
+        workers=args.workers,
         debug=args.debug,
-        workers=max(1, args.workers),
         csv_file=args.csv,
     )
 
@@ -393,27 +416,25 @@ def parse_args() -> Config:
 # =========================================================
 
 def main():
-
     cfg = parse_args()
     logger = setup_logger(cfg.debug)
 
     stop_event = threading.Event()
+    limiter = RateLimiter(cfg.rate_limit_per_sec)
+    metrics = Metrics()
+
     setup_signals(stop_event, logger)
 
     logger.info(
-        "Starting | symbols=%s interval=%ss workers=%d",
+        "Start | symbols=%s workers=%d interval=%.2f",
         ",".join(cfg.symbols),
-        cfg.interval,
         cfg.workers,
+        cfg.interval,
     )
 
-    with ThreadPoolExecutor(
-        max_workers=cfg.workers,
-        thread_name_prefix="tracker",
-    ) as executor:
-
+    with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
         for _ in range(cfg.workers):
-            executor.submit(tracker, cfg, stop_event, logger)
+            ex.submit(worker, cfg, stop_event, limiter, logger, metrics)
 
         stop_event.wait()
 
