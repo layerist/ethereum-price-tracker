@@ -1073,3 +1073,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# IMPROVEMENTS SUGGESTED:
+# - add persistent HTTP caching, Prometheus metrics, websocket fallback, config file support.
