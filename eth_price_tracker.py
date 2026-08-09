@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Reliable concurrent CoinMarketCap price tracker (v4).
+Reliable concurrent CoinMarketCap price tracker (v5).
 
 Main improvements over the previous version:
-- Rolling request-health metrics instead of lifetime-only adaptive decisions.
-- Circuit breaker with safe HALF_OPEN probe accounting under concurrency.
+- Generation-safe HALF_OPEN circuit-breaker permits under concurrency.
+- Explicit distinction between failed, breaker-blocked and cancelled batches.
+- Rolling request-health metrics for adaptive polling decisions.
 - Explicit application-level retries with interruptible backoff and Retry-After support.
-- Last-known-price cache: partial API failures no longer erase valid JSON prices.
-- Per-symbol freshness metadata and stale-symbol reporting.
-- Atomic and durable JSON replacement with unique temporary files.
-- CSV writer failure propagation and deterministic graceful draining.
-- Monotonic cycle scheduling with bounded jitter (no gradual timing drift).
+- Last-known-price cache: partial API failures never erase previously valid prices.
+- Per-symbol freshness, stale and never-seen reporting in JSON snapshots.
+- Atomic/durable JSON replacement with unique temporary files.
+- Fail-fast CSV writer monitoring, queue-drop accounting and deterministic draining.
+- Monotonic scheduling with bounded/clamped jitter.
 - Strict configuration validation and CLI controls for breaker/metrics/writer settings.
 - Optional environment-file loading when python-dotenv is installed.
 
@@ -22,7 +23,7 @@ Optional:
 
 Example:
     export CMC_API_KEY="YOUR_KEY"
-    python cmc_tracker_pro_v4.py \
+    python cmc_tracker_pro_v5.py \
         --symbols BTC ETH SOL XRP ADA \
         --interval 5 \
         --workers 4 \
@@ -79,7 +80,7 @@ except ImportError:
 
 
 API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-DEFAULT_USER_AGENT = "CMC-Reliable-Tracker/4.0"
+DEFAULT_USER_AGENT = "CMC-Reliable-Tracker/5.0"
 CSV_STOP = object()
 _thread_local = threading.local()
 
@@ -140,6 +141,14 @@ class BatchResult:
     prices: Dict[str, float]
     fetched_at: float
     attempts: int
+    status: str = "ok"  # ok | failed | blocked | cancelled
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class BreakerPermit:
+    probe: bool
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -230,45 +239,65 @@ class CircuitBreaker:
         self.consecutive_failures = 0
         self.open_until = 0.0
         self.half_open_inflight = 0
+        self.generation = 0
         self.lock = threading.Lock()
 
-    def acquire(self) -> bool:
+    def acquire(self) -> Optional[BreakerPermit]:
         with self.lock:
             now = time.monotonic()
             if self.state == self.OPEN:
                 if now < self.open_until:
-                    return False
+                    return None
                 self.state = self.HALF_OPEN
                 self.half_open_inflight = 0
+                self.generation += 1
 
             if self.state == self.HALF_OPEN:
                 if self.half_open_inflight >= self.half_open_max_calls:
-                    return False
+                    return None
                 self.half_open_inflight += 1
+                return BreakerPermit(probe=True, generation=self.generation)
 
-            return True
+            return BreakerPermit(probe=False, generation=self.generation)
 
-    def record_success(self) -> None:
+    def record_success(self, permit: BreakerPermit) -> None:
         with self.lock:
-            if self.state == self.HALF_OPEN:
+            if permit.probe:
+                # Ignore a late result from an older HALF_OPEN generation.
+                if self.state != self.HALF_OPEN or permit.generation != self.generation:
+                    return
                 self.half_open_inflight = max(0, self.half_open_inflight - 1)
                 self.state = self.CLOSED
-            self.consecutive_failures = 0
+                self.half_open_inflight = 0
+                self.consecutive_failures = 0
+                return
 
-    def record_failure(self) -> None:
+            # A CLOSED request may finish after another request has already opened
+            # the breaker. Such a late success must not close/reset the new state.
+            if self.state == self.CLOSED:
+                self.consecutive_failures = 0
+
+    def record_failure(self, permit: BreakerPermit) -> None:
         with self.lock:
-            if self.state == self.HALF_OPEN:
+            if permit.probe:
+                if self.state != self.HALF_OPEN or permit.generation != self.generation:
+                    return
                 self.half_open_inflight = max(0, self.half_open_inflight - 1)
                 self._open_locked()
                 return
 
+            # Ignore stale CLOSED permits that complete after the breaker changed state.
+            if self.state != self.CLOSED:
+                return
             self.consecutive_failures += 1
             if self.consecutive_failures >= self.fail_threshold:
                 self._open_locked()
 
-    def release_cancelled_probe(self) -> None:
+    def release_cancelled_probe(self, permit: BreakerPermit) -> None:
+        if not permit.probe:
+            return
         with self.lock:
-            if self.state == self.HALF_OPEN:
+            if self.state == self.HALF_OPEN and permit.generation == self.generation:
                 self.half_open_inflight = max(0, self.half_open_inflight - 1)
 
     def _open_locked(self) -> None:
@@ -286,6 +315,7 @@ class CircuitBreaker:
                 "consecutive_failures": self.consecutive_failures,
                 "open_remaining_sec": remaining,
                 "half_open_inflight": self.half_open_inflight,
+                "generation": self.generation,
             }
 
 
@@ -389,6 +419,10 @@ class AsyncCSVWriter(threading.Thread):
         self.logger = logger
         self.queue: queue.Queue[object] = queue.Queue(maxsize=cfg.write_queue_size)
         self.error: Optional[BaseException] = None
+        self._stats_lock = threading.Lock()
+        self.dropped_snapshots = 0
+        self.rows_written = 0
+        self.flushes = 0
         if cfg.csv_file:
             self._init_csv(cfg.csv_file)
 
@@ -409,6 +443,8 @@ class AsyncCSVWriter(threading.Thread):
             self.queue.put(item, timeout=0.5)
             return True
         except queue.Full:
+            with self._stats_lock:
+                self.dropped_snapshots += 1
             self.logger.warning("CSV queue is full; dropped one price snapshot")
             return False
 
@@ -455,10 +491,23 @@ class AsyncCSVWriter(threading.Thread):
     def _flush(self, buffer: List[List[Any]]) -> None:
         if not self.cfg.csv_file or not buffer:
             return
+        row_count = len(buffer)
         with self.cfg.csv_file.open("a", newline="", encoding="utf-8") as file:
             csv.writer(file).writerows(buffer)
             file.flush()
+        with self._stats_lock:
+            self.rows_written += row_count
+            self.flushes += 1
         buffer.clear()
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._stats_lock:
+            return {
+                "queued_items": self.queue.qsize(),
+                "dropped_snapshots": self.dropped_snapshots,
+                "rows_written": self.rows_written,
+                "flushes": self.flushes,
+            }
 
 
 class SessionRegistry:
@@ -588,7 +637,8 @@ def fetch_batch(
     stop_event: threading.Event,
     logger: logging.Logger,
 ) -> BatchResult:
-    if not breaker.acquire():
+    permit = breaker.acquire()
+    if permit is None:
         state = breaker.snapshot()
         logger.debug(
             "Breaker blocks batch=%s state=%s remaining=%.1fs",
@@ -596,22 +646,29 @@ def fetch_batch(
             state["state"],
             state["open_remaining_sec"],
         )
-        return BatchResult(symbols, {}, time.time(), 0)
+        return BatchResult(
+            symbols, {}, time.time(), 0, status="blocked", error="circuit breaker blocked request"
+        )
 
-    probe_released = False
+    permit_released = False
     attempts = 0
     last_error = "request failed"
 
     try:
         for retry_index in range(cfg.max_retries + 1):
             if stop_event.is_set():
-                breaker.release_cancelled_probe()
-                probe_released = True
-                break
+                breaker.release_cancelled_probe(permit)
+                permit_released = True
+                return BatchResult(
+                    symbols, {}, time.time(), attempts, status="cancelled", error="shutdown requested"
+                )
+
             if not limiter.wait(stop_event):
-                breaker.release_cancelled_probe()
-                probe_released = True
-                break
+                breaker.release_cancelled_probe(permit)
+                permit_released = True
+                return BatchResult(
+                    symbols, {}, time.time(), attempts, status="cancelled", error="shutdown requested"
+                )
 
             attempts += 1
             started = time.perf_counter()
@@ -635,11 +692,14 @@ def fetch_batch(
                         prices = extract_prices(payload, symbols, cfg.convert)
                         if prices:
                             metrics.record(True, latency, size)
-                            breaker.record_success()
+                            breaker.record_success(permit)
+                            permit_released = True
                             missing = sorted(set(symbols) - set(prices))
                             if missing:
                                 logger.warning("Missing prices: %s", ",".join(missing))
-                            return BatchResult(symbols, prices, time.time(), attempts)
+                            return BatchResult(
+                                symbols, prices, time.time(), attempts, status="ok", error=None
+                            )
                         metrics.record(False, latency, size)
                         last_error = "response contained no usable prices"
 
@@ -648,7 +708,8 @@ def fetch_batch(
                     last_error = f"HTTP {response.status_code}: {parse_error_message(response)}"
                 else:
                     metrics.record(False, latency, size)
-                    breaker.record_failure()
+                    breaker.record_failure(permit)
+                    permit_released = True
                     raise FatalAPIError(
                         f"CoinMarketCap HTTP {response.status_code}: {parse_error_message(response)}"
                     )
@@ -669,22 +730,27 @@ def fetch_batch(
                     last_error,
                 )
                 if stop_event.wait(delay):
-                    break
+                    breaker.release_cancelled_probe(permit)
+                    permit_released = True
+                    return BatchResult(
+                        symbols, {}, time.time(), attempts, status="cancelled", error="shutdown requested"
+                    )
 
-        if not probe_released:
-            breaker.record_failure()
+        if not permit_released:
+            breaker.record_failure(permit)
+            permit_released = True
         logger.warning(
             "Batch failed after %d attempt(s): symbols=%s error=%s",
             attempts,
             ",".join(symbols),
             last_error,
         )
-        return BatchResult(symbols, {}, time.time(), attempts)
+        return BatchResult(
+            symbols, {}, time.time(), attempts, status="failed", error=last_error
+        )
     except Exception:
-        if not probe_released:
-            # FatalAPIError already records failure before raising.
-            if not isinstance(sys.exc_info()[1], FatalAPIError):
-                breaker.record_failure()
+        if not permit_released:
+            breaker.record_failure(permit)
         raise
 
 
@@ -924,25 +990,34 @@ def build_json_snapshot(
     cache: PriceCache,
     fresh_symbols: Sequence[str],
     failed_symbols: Sequence[str],
+    blocked_symbols: Sequence[str],
     metrics: Mapping[str, Any],
     breaker: Mapping[str, Any],
+    csv_writer: Optional[AsyncCSVWriter] = None,
 ) -> Dict[str, Any]:
     now = time.time()
     metadata = cache.metadata(now, cfg.stale_after)
+    cached_prices = cache.prices()
     stale_symbols = [symbol for symbol, item in metadata.items() if item["stale"]]
-    return {
+    never_seen_symbols = sorted(set(cfg.symbols) - set(cached_prices))
+    result: Dict[str, Any] = {
         "timestamp": int(now),
         "timestamp_utc": utc_iso(now),
         "convert": cfg.convert,
-        "prices": cache.prices(),
+        "prices": cached_prices,
         "price_metadata": metadata,
         "symbols_requested": list(cfg.symbols),
-        "fresh_symbols": sorted(fresh_symbols),
-        "failed_symbols": sorted(failed_symbols),
+        "fresh_symbols": sorted(set(fresh_symbols)),
+        "failed_symbols": sorted(set(failed_symbols)),
+        "blocked_symbols": sorted(set(blocked_symbols)),
         "stale_symbols": stale_symbols,
+        "never_seen_symbols": never_seen_symbols,
         "metrics": dict(metrics),
         "circuit_breaker": dict(breaker),
     }
+    if csv_writer is not None and cfg.csv_file:
+        result["csv_writer"] = csv_writer.snapshot()
+    return result
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -981,20 +1056,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cycle_started = time.monotonic()
             results = run_cycle(cfg, executor, limiter, breaker, metrics, stop_event, logger)
 
+            if cfg.csv_file and csv_writer.error is not None:
+                raise TrackerError(f"CSV writer failed: {csv_writer.error}")
+
             fresh_prices: Dict[str, float] = {}
             successful_symbols = set()
+            failed_symbols_set = set()
+            blocked_symbols_set = set()
+
             for result in results:
+                requested = set(result.requested)
+                if result.status == "blocked":
+                    blocked_symbols_set.update(requested)
+                    continue
+                if result.status == "cancelled":
+                    continue
+
                 if result.prices:
                     cache.update(result.prices, result.fetched_at)
                     fresh_prices.update(result.prices)
                     successful_symbols.update(result.prices)
-                    csv_writer.enqueue(result.fetched_at, result.prices)
+                    if cfg.csv_file and not csv_writer.enqueue(result.fetched_at, result.prices):
+                        if csv_writer.error is not None:
+                            raise TrackerError(f"CSV writer failed: {csv_writer.error}")
 
-            failed_symbols = sorted(set(cfg.symbols) - successful_symbols)
+                failed_symbols_set.update(requested - set(result.prices))
+
+            # Never classify a symbol as failed when it succeeded in another result.
+            failed_symbols_set.difference_update(successful_symbols)
+            blocked_symbols_set.difference_update(successful_symbols)
+            failed_symbols = sorted(failed_symbols_set)
+            blocked_symbols = sorted(blocked_symbols_set)
+
             if fresh_prices:
                 log_prices(logger, fresh_prices, previous_prices, cfg.convert)
             elif not stop_event.is_set():
-                logger.warning("Cycle returned no fresh prices")
+                logger.warning(
+                    "Cycle returned no fresh prices (failed=%d blocked=%d)",
+                    len(failed_symbols),
+                    len(blocked_symbols),
+                )
 
             snapshot = metrics.snapshot()
             breaker_snapshot = breaker.snapshot()
@@ -1008,8 +1109,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         cache,
                         list(successful_symbols),
                         failed_symbols,
+                        blocked_symbols,
                         snapshot,
                         breaker_snapshot,
+                        csv_writer,
                     ),
                 )
 
@@ -1037,7 +1140,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 break
 
             jitter = random.uniform(-cfg.jitter_ratio, cfg.jitter_ratio) * interval
-            next_cycle_at = max(next_cycle_at + interval + jitter, time.monotonic())
+            scheduled_interval = min(
+                cfg.max_interval, max(cfg.min_interval, interval + jitter)
+            )
+            next_cycle_at = max(next_cycle_at + scheduled_interval, time.monotonic())
             stop_event.wait(max(0.0, next_cycle_at - time.monotonic()))
 
     except FatalAPIError:
@@ -1062,6 +1168,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif csv_writer.error is not None:
                 logger.error("CSV writer failed: %s", csv_writer.error)
                 exit_code = exit_code or 1
+            writer_stats = csv_writer.snapshot()
+            logger.info(
+                "CSV writer | rows=%d flushes=%d dropped_snapshots=%d",
+                writer_stats["rows_written"],
+                writer_stats["flushes"],
+                writer_stats["dropped_snapshots"],
+            )
 
         snapshot = metrics.snapshot()
         logger.info(
