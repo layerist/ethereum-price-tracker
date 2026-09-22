@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable concurrent CoinMarketCap price tracker (v6).
+Reliable concurrent CoinMarketCap price tracker (v7).
 
 Key properties:
 - Explicit retries with interruptible exponential backoff and Retry-After support.
@@ -23,7 +23,7 @@ Optional:
 
 Example:
     export CMC_API_KEY="YOUR_KEY"
-    python cmc_tracker_pro_v6.py \
+    python cmc_tracker_pro_v7.py \
         --symbols BTC ETH SOL XRP ADA \
         --interval 5 \
         --workers 4 \
@@ -81,11 +81,12 @@ except ImportError:
 
 
 API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-DEFAULT_USER_AGENT = "CMC-Reliable-Tracker/6.0"
+DEFAULT_USER_AGENT = "CMC-Reliable-Tracker/7.0"
 CSV_STOP = object()
 _thread_local = threading.local()
 
-RETRYABLE_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+RETRYABLE_HTTP = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+MAX_ERROR_BODY_CHARS = 500
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 CONVERT_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,31}$")
 
@@ -211,6 +212,10 @@ def percentile(values: Sequence[float], percent: float) -> float:
 
 class TokenBucketRateLimiter:
     def __init__(self, rate: float, capacity: int):
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("rate must be finite and > 0")
+        if capacity <= 0:
+            raise ValueError("capacity must be > 0")
         self.rate = float(rate)
         self.capacity = float(capacity)
         self.tokens = float(capacity)
@@ -242,6 +247,12 @@ class CircuitBreaker:
     HALF_OPEN = "HALF_OPEN"
 
     def __init__(self, fail_threshold: int, cooldown: float, half_open_max_calls: int):
+        if fail_threshold <= 0:
+            raise ValueError("fail_threshold must be > 0")
+        if not math.isfinite(cooldown) or cooldown <= 0:
+            raise ValueError("cooldown must be finite and > 0")
+        if half_open_max_calls <= 0:
+            raise ValueError("half_open_max_calls must be > 0")
         self.fail_threshold = fail_threshold
         self.cooldown = cooldown
         self.half_open_max_calls = half_open_max_calls
@@ -408,20 +419,25 @@ class AdaptiveInterval:
 class PriceCache:
     def __init__(self):
         self._data: Dict[str, PricePoint] = {}
+        self._lock = threading.RLock()
 
     def update(self, prices: Mapping[str, float], fetched_at: float) -> None:
-        for symbol, price in prices.items():
-            previous = self._data.get(symbol)
-            # Do not allow a late concurrent result to make the cache older.
-            if previous is None or fetched_at >= previous.updated_at:
-                self._data[symbol] = PricePoint(price=price, updated_at=fetched_at)
+        with self._lock:
+            for symbol, price in prices.items():
+                previous = self._data.get(symbol)
+                # Do not allow a late concurrent result to make the cache older.
+                if previous is None or fetched_at >= previous.updated_at:
+                    self._data[symbol] = PricePoint(price=price, updated_at=fetched_at)
 
     def prices(self) -> Dict[str, float]:
-        return {symbol: point.price for symbol, point in sorted(self._data.items())}
+        with self._lock:
+            return {symbol: point.price for symbol, point in sorted(self._data.items())}
 
     def metadata(self, now: float, stale_after: float) -> Dict[str, Dict[str, Any]]:
         result: Dict[str, Dict[str, Any]] = {}
-        for symbol, point in sorted(self._data.items()):
+        with self._lock:
+            items = list(sorted(self._data.items()))
+        for symbol, point in items:
             age = max(0.0, now - point.updated_at)
             result[symbol] = {
                 "updated_at": utc_iso(point.updated_at),
@@ -651,7 +667,7 @@ def parse_error_message(response: requests.Response) -> str:
         pass
 
     text = " ".join(response.text.split())
-    return text[:500] or response.reason or "unknown error"
+    return text[:MAX_ERROR_BODY_CHARS] or response.reason or "unknown error"
 
 
 def validate_cmc_payload(payload: Mapping[str, Any]) -> None:
@@ -1150,7 +1166,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
         write_queue_size=args.csv_queue_size,
         csv_flush_rows=args.csv_flush_rows,
         csv_flush_sec=args.csv_flush_sec,
-        proxy=args.proxy,
+        proxy=args.proxy.strip() if args.proxy else None,
         one_shot=args.one_shot,
         quiet=args.quiet,
         debug=args.debug,
@@ -1231,7 +1247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         csv_writer.start()
 
     executor = ThreadPoolExecutor(
-        max_workers=cfg.workers,
+        max_workers=min(cfg.workers, max(1, math.ceil(len(cfg.symbols) / cfg.batch_size))),
         thread_name_prefix="fetch",
     )
     next_cycle_at = time.monotonic()
@@ -1380,6 +1396,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if cfg.csv_file:
             csv_writer.close()
+            # The stop sentinel is FIFO, so reaching it guarantees all previously
+            # accepted snapshots have been consumed. Join remains bounded in case
+            # the writer is stuck in an OS-level file operation.
             csv_writer.join(timeout=max(5.0, cfg.csv_flush_sec * 3.0))
 
             if csv_writer.is_alive():
