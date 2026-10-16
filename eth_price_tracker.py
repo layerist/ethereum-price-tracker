@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reliable concurrent CoinMarketCap price tracker (v7).
+Reliable concurrent CoinMarketCap price tracker (v8).
 
 Key properties:
 - Explicit retries with interruptible exponential backoff and Retry-After support.
@@ -16,14 +16,14 @@ Key properties:
 - Monotonic scheduling, bounded jitter and graceful SIGINT/SIGTERM shutdown.
 
 Requirements:
-    pip install requests colorama
+    pip install requests
 
 Optional:
-    pip install python-dotenv
+    pip install colorama python-dotenv
 
 Example:
     export CMC_API_KEY="YOUR_KEY"
-    python cmc_tracker_pro_v7.py \
+    python cmc_tracker_pro_v8.py \
         --symbols BTC ETH SOL XRP ADA \
         --interval 5 \
         --workers 4 \
@@ -81,7 +81,7 @@ except ImportError:
 
 
 API_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
-DEFAULT_USER_AGENT = "CMC-Reliable-Tracker/7.0"
+DEFAULT_USER_AGENT = "CMC-Reliable-Tracker/8.0"
 CSV_STOP = object()
 _thread_local = threading.local()
 
@@ -448,7 +448,9 @@ class PriceCache:
 
 
 class AsyncCSVWriter(threading.Thread):
-    daemon = False
+    # The normal shutdown path drains the FIFO and joins. A daemon prevents an
+    # indefinitely blocked filesystem operation from holding process exit hostage.
+    daemon = True
 
     def __init__(self, cfg: Config, logger: logging.Logger):
         super().__init__(name="csv-writer")
@@ -467,13 +469,24 @@ class AsyncCSVWriter(threading.Thread):
 
     def _init_csv(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        header = ["timestamp_unix", "timestamp_utc", "symbol", f"price_{self.cfg.convert}"]
         if path.exists() and path.stat().st_size > 0:
+            # Appending quotes for a different currency (or to an unrelated file)
+            # would silently corrupt the meaning of the historical CSV data.
+            with path.open("r", newline="", encoding="utf-8-sig") as file:
+                try:
+                    existing_header = next(csv.reader(file))
+                except (StopIteration, csv.Error) as exc:
+                    raise TrackerError(f"Invalid existing CSV header: {path}") from exc
+            if existing_header != header:
+                raise TrackerError(
+                    f"CSV header mismatch in {path}: expected {header!r}, "
+                    f"found {existing_header!r}"
+                )
             return
 
         with path.open("w", newline="", encoding="utf-8") as file:
-            csv.writer(file).writerow(
-                ["timestamp_unix", "timestamp_utc", "symbol", f"price_{self.cfg.convert}"]
-            )
+            csv.writer(file).writerow(header)
             file.flush()
             os.fsync(file.fileno())
 
@@ -570,6 +583,7 @@ class SessionRegistry:
     def __init__(self):
         self.lock = threading.Lock()
         self.sessions: List[requests.Session] = []
+        self.generation = 0
 
     def register(self, session: requests.Session) -> None:
         with self.lock:
@@ -578,6 +592,7 @@ class SessionRegistry:
     def close_all(self) -> None:
         with self.lock:
             sessions, self.sessions = self.sessions, []
+            self.generation += 1
 
         for session in sessions:
             try:
@@ -610,6 +625,9 @@ def create_session(cfg: Config) -> requests.Session:
     )
 
     if cfg.proxy:
+        # Requests otherwise lets environment proxy settings override
+        # session.proxies, even when --proxy was explicitly supplied.
+        session.trust_env = False
         session.proxies.update({"http": cfg.proxy, "https": cfg.proxy})
 
     SESSION_REGISTRY.register(session)
@@ -617,10 +635,20 @@ def create_session(cfg: Config) -> requests.Session:
 
 
 def get_session(cfg: Config) -> requests.Session:
+    identity = (
+        SESSION_REGISTRY.generation,
+        cfg.api_key,
+        cfg.proxy,
+        cfg.pool_connections,
+        cfg.pool_maxsize,
+    )
     session = getattr(_thread_local, "session", None)
-    if session is None:
+    if session is None or getattr(_thread_local, "session_identity", None) != identity:
+        if session is not None:
+            session.close()
         session = create_session(cfg)
         _thread_local.session = session
+        _thread_local.session_identity = identity
     return session
 
 
@@ -630,15 +658,19 @@ def retry_after_seconds(response: requests.Response, maximum: float) -> Optional
         return None
 
     try:
-        return min(maximum, max(0.0, float(value)))
-    except ValueError:
+        seconds = float(value)
+    except (TypeError, ValueError):
         try:
             parsed = parsedate_to_datetime(value)
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return min(maximum, max(0.0, parsed.timestamp() - time.time()))
+            seconds = parsed.timestamp() - time.time()
         except (TypeError, ValueError, OverflowError):
             return None
+
+    if math.isnan(seconds):
+        return None
+    return min(maximum, max(0.0, seconds))
 
 
 def backoff_delay(
@@ -651,7 +683,13 @@ def backoff_delay(
         if header_delay is not None:
             return header_delay
 
-    exponential = cfg.backoff_factor * (2**retry_index)
+    # ldexp avoids constructing enormous Python integers for high retry counts.
+    try:
+        exponential = math.ldexp(cfg.backoff_factor, retry_index)
+    except OverflowError:
+        return cfg.max_backoff
+    if exponential * 0.75 >= cfg.max_backoff:
+        return cfg.max_backoff
     jittered = random.uniform(exponential * 0.75, exponential * 1.25)
     return min(cfg.max_backoff, jittered)
 
@@ -662,7 +700,7 @@ def parse_error_message(response: requests.Response) -> str:
         status = payload.get("status", {}) if isinstance(payload, dict) else {}
         message = status.get("error_message") if isinstance(status, dict) else None
         if message:
-            return str(message)
+            return str(message)[:MAX_ERROR_BODY_CHARS]
     except ValueError:
         pass
 
@@ -879,7 +917,11 @@ def _fsync_directory(path: Path) -> None:
         return
 
     try:
-        os.fsync(fd)
+        try:
+            os.fsync(fd)
+        except OSError:
+            # Directory fsync is unsupported on some POSIX filesystems.
+            pass
     finally:
         os.close(fd)
 
@@ -986,10 +1028,14 @@ def run_cycle(
             logger.error("Fatal API error for batch=%s: %s", ",".join(future_map[future]), exc)
             break
         except Exception as exc:
+            batch = future_map[future]
             logger.exception(
                 "Unexpected batch error for %s: %s",
-                ",".join(future_map[future]),
+                ",".join(batch),
                 exc,
+            )
+            results.append(
+                BatchResult(batch, {}, time.time(), 0, "failed", f"{type(exc).__name__}: {exc}")
             )
 
     if fatal_error is not None:
@@ -1227,7 +1273,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     breaker = CircuitBreaker(cfg.fail_threshold, cfg.cooldown, cfg.half_open_max_calls)
     metrics = Metrics(cfg.metrics_window)
     adaptive_interval = AdaptiveInterval(cfg)
-    csv_writer = AsyncCSVWriter(cfg, logger)
     cache = PriceCache()
     previous_prices: Dict[str, float] = {}
     exit_code = 0
@@ -1243,16 +1288,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "yes" if cfg.proxy else "no",
     )
 
-    if cfg.csv_file:
-        csv_writer.start()
-
-    executor = ThreadPoolExecutor(
-        max_workers=min(cfg.workers, max(1, math.ceil(len(cfg.symbols) / cfg.batch_size))),
-        thread_name_prefix="fetch",
-    )
+    csv_writer: Optional[AsyncCSVWriter] = None
+    executor: Optional[ThreadPoolExecutor] = None
     next_cycle_at = time.monotonic()
 
     try:
+        if cfg.csv_file:
+            csv_writer = AsyncCSVWriter(cfg, logger)
+            csv_writer.start()
+
+        executor = ThreadPoolExecutor(
+            max_workers=min(cfg.workers, max(1, math.ceil(len(cfg.symbols) / cfg.batch_size))),
+            thread_name_prefix="fetch",
+        )
+
         while not stop_event.is_set():
             cycle_started = time.monotonic()
             results = run_cycle(
@@ -1265,7 +1314,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 logger,
             )
 
-            if cfg.csv_file and csv_writer.error is not None:
+            if csv_writer is not None and csv_writer.error is not None:
                 raise TrackerError(f"CSV writer failed: {csv_writer.error}")
 
             fresh_prices: Dict[str, float] = {}
@@ -1291,7 +1340,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     fresh_prices.update(result.prices)
                     successful_symbols.update(returned)
 
-                    if cfg.csv_file:
+                    if csv_writer is not None:
                         queued = csv_writer.enqueue(result.fetched_at, result.prices)
                         if not queued and csv_writer.error is not None:
                             raise TrackerError(f"CSV writer failed: {csv_writer.error}")
@@ -1391,18 +1440,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         stop_event.set()
 
-        executor.shutdown(wait=True, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         SESSION_REGISTRY.close_all()
 
-        if cfg.csv_file:
+        if csv_writer is not None:
             csv_writer.close()
             # The stop sentinel is FIFO, so reaching it guarantees all previously
             # accepted snapshots have been consumed. Join remains bounded in case
             # the writer is stuck in an OS-level file operation.
-            csv_writer.join(timeout=max(5.0, cfg.csv_flush_sec * 3.0))
+            if csv_writer.ident is not None:
+                csv_writer.join(timeout=max(5.0, cfg.csv_flush_sec * 3.0))
 
             if csv_writer.is_alive():
-                logger.error("CSV writer did not stop cleanly")
+                logger.error("CSV writer did not stop cleanly; queued CSV data may be lost")
                 exit_code = exit_code or 1
             elif csv_writer.error is not None:
                 logger.error("CSV writer failed: %s", csv_writer.error)
